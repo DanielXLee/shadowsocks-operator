@@ -1,0 +1,7 @@
+apiVersion: sss.jump.com/v1alpha1
+kind: Sss
+metadata:
+  name: example-sss
+spec:
+  # Add fields here
+  size: 3
