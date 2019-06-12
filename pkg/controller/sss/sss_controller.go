@@ -2,11 +2,14 @@ package sss
 
 import (
 	"context"
+	"reflect"
 
 	sssv1alpha1 "github.com/DanielXLee/shadowsocks-operator/pkg/apis/sss/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,7 +56,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Pods and requeue the owner Sss
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
+	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &sssv1alpha1.Sss{},
 	})
@@ -87,67 +90,132 @@ func (r *ReconcileSss) Reconcile(request reconcile.Request) (reconcile.Result, e
 	reqLogger.Info("Reconciling Sss")
 
 	// Fetch the Sss instance
-	instance := &sssv1alpha1.Sss{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	sssInstance := &sssv1alpha1.Sss{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, sssInstance)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
+			reqLogger.Info("Sss resource not found. Ignoring since object must be deleted")
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
+		reqLogger.Error(err, "Failed to get Sss")
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
-
-	// Set Sss instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
+	// Check if the deployment already exists, if not create a new one
+	found := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: sssInstance.Name, Namespace: sssInstance.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+		// Define a new deployment
+		dep := r.deploymentForSss(sssInstance)
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		err = r.client.Create(context.TODO(), dep)
 		if err != nil {
+			reqLogger.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 			return reconcile.Result{}, err
 		}
-
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
+		// Deployment created successfully - return and requeue
+		return reconcile.Result{Requeue: true}, nil
 	} else if err != nil {
+		reqLogger.Error(err, "Failed to get Deployment")
 		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	// Ensure the deployment size is the same as the spec
+	size := sssInstance.Spec.Size
+	if *found.Spec.Replicas != size {
+		found.Spec.Replicas = &size
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return reconcile.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// Update the Sss status with the pod names
+	// List the pods for this sss's deployment
+	podList := &corev1.PodList{}
+	labelSelector := labels.SelectorFromSet(labelsForSss(sssInstance.Name))
+	listOps := &client.ListOptions{Namespace: sssInstance.Namespace, LabelSelector: labelSelector}
+	err = r.client.List(context.TODO(), listOps, podList)
+	if err != nil {
+		reqLogger.Error(err, "Failed to list pods", "Sss.Namespace", sssInstance.Namespace, "Sss.Name", sssInstance.Name)
+		return reconcile.Result{}, err
+	}
+	podNames := getPodNames(podList.Items)
+
+	// Update status.Nodes if needed
+	if !reflect.DeepEqual(podNames, sssInstance.Status.Nodes) {
+		sssInstance.Status.Nodes = podNames
+		err := r.client.Status().Update(context.TODO(), sssInstance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Sss status")
+			return reconcile.Result{}, err
+		}
+	}
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *sssv1alpha1.Sss) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
-	}
-	return &corev1.Pod{
+// deploymentForSss returns a sss Deployment object
+func (r *ReconcileSss) deploymentForSss(m *sssv1alpha1.Sss) *appsv1.Deployment {
+	ls := labelsForSss(m.Name)
+	replicas := m.Spec.Size
+
+	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
+			Name:      m.Name,
+			Namespace: m.Namespace,
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "shadowsocks",
-					Image: "mritd/shadowsocks",
-					Args:  []string{"-m", "ss-server", "-s", "-s 0.0.0.0 -p 6443 -m chacha20-ietf-poly1305 -k test123", "-x", "-e", "kcpserver", "-k", "-t 127.0.0.1:6443 -l :6500 -mode fast2"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: ls,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: ls,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "shadowsocks",
+						Image: "mritd/shadowsocks",
+						Args:  []string{"-m", "ss-server", "-s", "-s 0.0.0.0 -p 6443 -m chacha20-ietf-poly1305 -k test123", "-x", "-e", "kcpserver", "-k", "-t 127.0.0.1:6443 -l :6500 -mode fast2"},
+						Ports: []corev1.ContainerPort{{
+							HostPort:      6443,
+							ContainerPort: 6443,
+							Name:          "sssclient",
+						}, {
+							HostPort:      6500,
+							ContainerPort: 6500,
+							Protocol:      "UDP",
+							Name:          "kcpclient",
+						}},
+					}},
 				},
 			},
 		},
 	}
+	// Set Sss instance as the owner and controller
+	controllerutil.SetControllerReference(m, dep, r.scheme)
+	return dep
+}
+
+// labelsForSss returns the labels for selecting the resources
+// belonging to the given sss CR name.
+func labelsForSss(name string) map[string]string {
+	return map[string]string{"app": "sss", "sss_cr": name}
+}
+
+// getPodNames returns the pod names of the array of pods passed in
+func getPodNames(pods []corev1.Pod) []string {
+	var podNames []string
+	for _, pod := range pods {
+		podNames = append(podNames, pod.Name)
+	}
+	return podNames
 }
